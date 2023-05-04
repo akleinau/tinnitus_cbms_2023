@@ -1,0 +1,241 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(dtw)
+library(corrr)
+library(rlang)
+library(tidymodels) #fist install rlang from source to get the newest version necessary for tidymodels
+
+source('functions.R')
+source('grouped_predictions_helper.R')
+
+data <- setup_diary()
+clin_data <- setup_clinical()
+```
+
+
+# Linear Regression all
+```{r fig.height=5, fig.width=20}
+local_data <- data %>% group_by(user_id) %>%  filter(n() >= 5) %>% ungroup()
+tmp <- split_intra_patient(local_data, 0.2)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]] 
+
+lm_model <- linear_reg() %>% set_engine('lm') %>% set_mode('regression')
+
+#calculate intercept, slope
+models <- train_data %>% group_by(user_id) %>% 
+  summarize(tidy(fit(lm_model, cumberness ~ loudness, cur_data()))) %>% 
+  select(term, estimate) %>% pivot_wider(names_from=term, values_from=estimate) %>% 
+  rename(intercept="(Intercept)", reg_loudness=loudness)
+local_data <- train_data %>% mutate("split"="train") %>% add_row(test_data %>% mutate("split"="test")) %>% right_join(models) #join train, test and models
+
+#calculate residuals
+local_data <- local_data %>% mutate(prediction=intercept+loudness*reg_loudness) %>% mutate(residuals=cumberness-prediction)
+MSE_data <- local_data %>% group_by(user_id, split) %>% summarize(MSE = sum(residuals^2)/n())
+
+results_linear_regression <- MSE_data
+
+#boxplot
+ggplot(MSE_data, aes(x=MSE, color=split)) + geom_boxplot() + theme(legend.position="None")+
+  scale_x_continuous(breaks=seq(0,1000,25)) + facet_wrap(vars(factor(split)), nrow=2) + scale_y_continuous(breaks=c())
+#scatterplot residuals
+ggplot(local_data, aes(y=split)) + geom_jitter(aes(x=residuals, color=split), alpha=0.3) + geom_vline(xintercept=0)
+ggplot(local_data %>% group_by(user_id, split) %>% summarize(residual_person=mean(residuals)), aes(y=split)) + geom_jitter(aes(x=residual_person, color=split)) + geom_vline(xintercept=0)
+#difference test train MSE
+ggplot(MSE_data %>% select(user_id, split, MSE) %>% pivot_wider(names_from=split, values_from=MSE) %>% mutate(range=log(abs(train-test)+1)), aes(x=range)) + 
+  scale_y_continuous(name="MSE") + geom_linerange(aes(ymin=train, ymax=test, color=factor(sign(train-test)))) +
+  scale_color_discrete(breaks=c("-1","1"), labels=c("test > train", "train > test")) + theme_bw()
+
+#calculate correlations on residuals
+attributes <- c("residuals", "jawbone", "neck", "tin_day", "tin_cumber", "tin_max", "movement", "stress", "emotion")
+correlations <- local_data %>% group_by(user_id) %>% select(all_of(attributes)) %>% 
+  summarize(correlate(x=cur_data(), diagonal=1, quiet=TRUE) %>% filter(term=="residuals")) %>% select(!c("term"))
+cor_vis_data <- correlations %>% pivot_longer(cols=all_of(attributes[-1]), names_to="term", values_to="correlation") #[-1] removes residuals from attributes
+ggplot(cor_vis_data, aes(x=term, y=correlation, color=user_id, group=user_id)) + geom_line() + theme_bw() + theme(legend.position="None")
+
+#sample
+sample <- local_data %>% sample_data(1)
+ggplot(sample, aes(x=loudness)) + geom_point(aes(y=cumberness, color=split), alpha=0.8) +geom_line(aes(y=prediction),alpha=0.3)
+ggplot(sample, aes(x=loudness)) + geom_point(aes(y=residuals, color=split), alpha=0.8) + geom_hline(yintercept=0)
+```
+# linear regression for each individual (without neighbors)
+```{r fig.height=5, fig.width=20}
+#distances only included as they are required parameter for regression. They are not used!
+very_distant_number <- 1000
+very_small_number <- 0.001
+
+same_user <- function(x1, x2) {
+  return((x1 %>% slice_head(n=1) %>% pull(user_id)) == (x2 %>% slice_head(n=1) %>% pull(user_id)))
+}
+
+#random
+distance.random <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  return(runif(1)+very_small_number)
+}
+
+distance.current <- distance.random
+
+local_data <- data %>% 
+  group_by(user_id) %>%  filter(n() >= 5) %>% ungroup()
+
+#add local date
+minTimes <- local_data %>% group_by(user_id) %>% summarize("min" = min(ts))
+local_data <- local_data %>% left_join(minTimes, by=c("user_id")) %>% mutate(local_date = ts-min) %>% ungroup() 
+
+tmp <- split_intra_patient(local_data, 0.2)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+tmp <- standardize_cumberness(train_data, test_data)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+tmp <- standardize_attributes(train_data, test_data)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+attributes <- c("loudness", "jawbone", "neck", "tin_day", "tin_cumber", "tin_max", "movement", "stress", "emotion")
+lm_model <- linear_reg() %>% set_engine('lm') %>% set_mode('regression')
+
+#----------------------regression------------------------------
+tmp <- regression(train_data, test_data, attributes, lm_model, "std_cumberness", "select", distance.current, amount = 1, threshold="") #only one neighbor!
+train_data <- tmp[[1]]
+test_data <- tmp[[2]] 
+local_data <- train_data %>% add_row(test_data)
+
+#constrain to 0-100
+local_data <- local_data %>% mutate(pMax = (100-cumberness_mean)/cumberness_stddev)
+local_data <- local_data %>% mutate(pMin = (0-cumberness_mean)/cumberness_stddev)
+local_data <- local_data %>% 
+  mutate(predictionGroup_constrained = if_else(prediction > pMax, pMax, prediction)) %>%
+  mutate(predictionGroup_constrained = if_else(predictionGroup_constrained < pMin, pMin, predictionGroup_constrained)) %>%
+    mutate(std_residuals_constrained=std_cumberness-predictionGroup_constrained) %>%
+    mutate(residuals_constrained=std_residuals_constrained*cumberness_stddev)
+
+
+MSE_data <- local_data %>% group_by(user_id, split) %>% summarize(MSE = sum(residuals_constrained^2)/n())
+
+MSE_data %>% ungroup() %>% filter(split=="test") %>% summarize(mean_MSE = mean(MSE), median_MSE = median(MSE))
+
+results_linear_regression <- MSE_data
+
+#boxplot
+ggplot(MSE_data, aes(x=MSE, color=split)) + geom_boxplot() + theme(legend.position="None")+
+  scale_x_continuous(breaks=seq(0,1000,25), limits=c(0,100)) + facet_wrap(vars(factor(split)), nrow=2) + scale_y_continuous(breaks=c())
+#scatterplot residuals
+ggplot(local_data, aes(y=split)) + geom_jitter(aes(x=residuals, color=split), alpha=0.3) + geom_vline(xintercept=0)
+ggplot(local_data %>% group_by(user_id, split) %>% summarize(residual_person=mean(residuals)), aes(y=split)) + geom_jitter(aes(x=residual_person, color=split)) + geom_vline(xintercept=0)
+#difference test train MSE
+ggplot(MSE_data %>% select(user_id, split, MSE) %>% pivot_wider(names_from=split, values_from=MSE) %>% mutate(range=log(abs(train-test)+1)), aes(x=range)) + 
+  scale_y_continuous(name="MSE") + geom_linerange(aes(ymin=train, ymax=test, color=factor(sign(train-test)))) +
+  scale_color_discrete(breaks=c("-1","1"), labels=c("test > train", "train > test")) + theme_bw()
+
+#calculate correlations on residuals
+attributes <- c("residuals", "jawbone", "neck", "tin_day", "tin_cumber", "tin_max", "movement", "stress", "emotion")
+correlations <- local_data %>% group_by(user_id) %>% select(all_of(attributes)) %>% 
+  summarize(correlate(x=cur_data(), diagonal=1, quiet=TRUE) %>% filter(term=="residuals")) %>% select(!c("term"))
+cor_vis_data <- correlations %>% pivot_longer(cols=all_of(attributes[-1]), names_to="term", values_to="correlation") #[-1] removes residuals from attributes
+ggplot(cor_vis_data, aes(x=term, y=correlation, color=user_id, group=user_id)) + geom_line() + theme_bw() + theme(legend.position="None")
+
+```
+
+# Regression tree for each individual (without neighbors)
+```{r fig.height=5, fig.width=20}
+local_data <- data %>% 
+  group_by(user_id) %>%  filter(n() >= 5) %>% ungroup()
+
+#add local date
+minTimes <- local_data %>% group_by(user_id) %>% summarize("min" = min(ts))
+local_data <- local_data %>% left_join(minTimes, by=c("user_id")) %>% mutate(local_date = ts-min) %>% ungroup() 
+
+tmp <- split_intra_patient(local_data, 0.2)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+tmp <- standardize_cumberness(train_data, test_data)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+tmp <- standardize_attributes(train_data, test_data)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+attributes <- c("loudness", "jawbone", "neck", "tin_day", "tin_cumber", "tin_max", "movement", "stress", "emotion")
+
+#get highest correlations
+correlations <- get_correlations(train_data, "cumberness", attributes)
+highest_corr <- correlations %>% group_by(user_id)  %>% slice_max(absCorrelation) %>% rename(reg1_term=term, reg1_correlation=correlation) %>% select(!c("absCorrelation")) %>% ungroup()
+
+# create columns for regression based on highest correlation
+train_data <- highest_corr %>% left_join(train_data %>% pivot_longer(cols=attributes, names_to="column", values_to="reg1_value"), by=c("user_id","reg1_term" = "column")) %>% select(name, ts, reg1_term, reg1_correlation, reg1_value) %>% inner_join(train_data, by=c("name", "ts"))
+test_data <- highest_corr %>% left_join(test_data %>% pivot_longer(cols=attributes, names_to="column", values_to="reg1_value"), by=c("user_id","reg1_term" = "column")) %>% select(user_id, ts, reg1_term, reg1_correlation, reg1_value) %>% inner_join(test_data, by=c("user_id", "ts"))
+
+local_data <- train_data %>% mutate(split="train") %>% add_row(test_data %>% mutate(split="test"))
+
+lm_model <- decision_tree(tree_depth=10, min_n=10) %>% set_mode('regression')
+
+#calculate regression tree predictions
+model <- function (data) {return( fit_xy(lm_model, x= select_features(data, "std_cumberness", "select"), y= data %>%
+                                                pull("std_cumberness"))) }
+#model <- function (data) {return( fit(lm_model, cumberness ~ reg1_value, data)) }
+
+local_data <- local_data %>% 
+  mutate(cur_user_id = user_id) %>%
+  mutate(user_id_copy = user_id) %>%
+  group_by(user_id_copy) %>%
+  mutate(
+    predict(
+      model(cur_data() %>% filter(split=="train")), #use only train data for model fitting
+      cur_data())) %>% #predict model on all data
+  ungroup() %>%
+  rename(prediction=.pred) %>%
+  mutate(std_residuals=std_cumberness-prediction) %>%
+  mutate(residuals=std_residuals*cumberness_stddev)
+
+#constrain to 0-100
+local_data <- local_data %>% mutate(pMax = (100-cumberness_mean)/cumberness_stddev)
+local_data <- local_data %>% mutate(pMin = (0-cumberness_mean)/cumberness_stddev)
+local_data <- local_data %>% 
+  mutate(predictionGroup_constrained = if_else(prediction > pMax, pMax, prediction)) %>%
+  mutate(predictionGroup_constrained = if_else(predictionGroup_constrained < pMin, pMin, predictionGroup_constrained)) %>%
+    mutate(std_residuals_constrained=std_cumberness-predictionGroup_constrained) %>%
+    mutate(residuals_constrained=std_residuals_constrained*cumberness_stddev)
+
+#MSE visualizations
+
+MSE_data <- local_data %>% 
+         group_by(user_id, split) %>% 
+         summarize(MSE = sum(residuals_constrained^2)/n())
+
+results_regression_tree <- MSE_data
+
+ggplot(MSE_data, 
+       aes(x=MSE, color=split)) + 
+  geom_boxplot() + theme(legend.position="None")+
+  scale_x_continuous(breaks=seq(0,1000,25), limits=c(0,1000)) + 
+  facet_wrap(vars(factor(split)), nrow=2) + 
+  scale_y_continuous(breaks=c())
+
+ggplot(local_data, aes(y=split)) + 
+  geom_jitter(aes(x=residuals, color=split), alpha=0.3) + 
+  geom_vline(xintercept=0)
+```
+compare MSE of linear regression and regression tree
+```{r fig.height=5, fig.width=20}
+results <- results_linear_regression %>% inner_join(results_regression_tree, by=c("user_id", "split"), suffix=c("_linear", "_tree")) %>% filter(split=="test")
+results <- results %>% mutate(tree_better = (MSE_tree < MSE_linear))
+results
+results %>% filter(tree_better)
+
+local_data <- data %>% group_by(user_id) %>%  filter(n() >= 5) %>% ungroup()
+local_data <- local_data %>% inner_join(results, by=c("user_id")) %>% mutate(tree_better = (MSE_tree < MSE_linear))
+local_data
+#counting for how many people which method is better
+ggplot(local_data %>% group_by(user_id, tree_better) %>% summarize(count=n()), aes(x=tree_better, y=count, color=tree_better)) + geom_boxplot() + coord_flip()
+t.test(results$MSE_linear, results$MSE_tree)
+```

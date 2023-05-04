@@ -1,0 +1,598 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(dtw)
+library(corrr)
+library(rlang)
+library(tidymodels) #fist install rlang from source to get the newest version necessary for tidymodels
+library(leaps)
+
+source('functions.R')
+source('grouped_predictions_helper.R')
+
+data <- setup_diary()
+```
+
+
+```{r}
+very_distant_number <- 1000
+very_small_number <- 0.001
+
+same_user <- function(x1, x2) {
+  return((x1 %>% slice_head(n=1) %>% pull(user_id)) == (x2 %>% slice_head(n=1) %>% pull(user_id)))
+}
+
+#random
+distance.random <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  return(runif(1)+very_small_number)
+}
+
+#corr parts
+distance.corr_parts_manhattan <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  patient1 <- x1 %>% slice_head(n=1)
+  patient2 <- x2 %>% slice_head(n=1)
+  dist <- c()
+  for (colname in colnames(patient1)) {
+    if (grepl("corr_",colname)) {
+      dist = c(dist, abs(patient1 %>% pull(colname) - patient2 %>% pull(colname)))
+    }
+  }
+  return(sum(dist))
+}
+
+#corr parts
+distance.corr_parts_euclidian <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  patient1 <- x1 %>% slice_head(n=1)
+  patient2 <- x2 %>% slice_head(n=1)
+  dist <- c()
+  for (colname in colnames(patient1)) {
+    if (grepl("corr_",colname)) {
+      dist = c(dist, (patient1 %>% pull(colname) - patient2 %>% pull(colname))^2)
+    }
+  }
+  return(sum(dist))
+}
+
+#corr parts
+distance.corr_parts_cosine <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  patient1 <- x1 %>% slice_head(n=1)
+  patient2 <- x2 %>% slice_head(n=1)
+  A = c()
+  B = c()
+  for (colname in colnames(patient1)) {
+    if (grepl("corr_",colname)) {
+        A <- c(A, patient1 %>% pull(colname))
+        B <- c(B,patient2 %>% pull(colname))
+    }
+  }
+
+  cosine_distance = 1 - ((A*B) / (sqrt(sum(A^2)) * sqrt(sum(B^2)))  )
+  
+  return(cosine_distance)
+}
+
+#day similarity using cosine distance
+cosine <- function(x1, x2) {
+  x <- x1 %>% full_join(x2, by=character(), suffix=c(".1", ".2")) #cross_join
+  attributes <- c("raw_loudness", "raw_jawbone", "raw_neck", "raw_tin_day", "raw_tin_cumber", "raw_tin_max", "raw_movement", "raw_stress", "raw_emotion", "cumberness")
+  x$AB = 0
+  x$A2 = 0
+  x$B2 = 0
+  for (colname in attributes) {
+    colname1 <- str_c(colname, ".1") 
+    colname2 <- str_c(colname, ".2") 
+    
+    #calculate individual parts of cosine similarity
+    x <- x %>% 
+      mutate(AB = AB + (.data[[colname1]] * .data[[colname2]])) %>%
+      mutate(A2 = A2 + .data[[colname1]]^2) %>%
+      mutate(B2 = B2 + .data[[colname2]]^2)
+    
+  }
+  #calculate cosine similarity
+  x <- x %>% mutate(dist= 1 - (AB / (sqrt(A2) * sqrt(B2))))
+  
+  return(x)
+}
+
+manhattan <- function(x1, x2) {
+  x <- x1 %>% full_join(x2, by=character(), suffix=c(".1", ".2")) #cross_join
+  attributes <- c("raw_loudness", "raw_jawbone", "raw_neck", "raw_tin_day", "raw_tin_cumber", "raw_tin_max", "raw_movement", "raw_stress", "raw_emotion", "cumberness")
+  x$dist = 0
+  for (colname in attributes) {
+    colname1 <- str_c(colname, ".1") 
+    colname2 <- str_c(colname, ".2") 
+    
+    x <- x %>% mutate(dist = dist + abs(.data[[colname1]] - .data[[colname2]]))
+  }
+  
+  return(x)
+}
+
+euclidian <- function(x1, x2) {
+  x <- x1 %>% full_join(x2, by=character(), suffix=c(".1", ".2")) #cross_join
+  attributes <- c("raw_loudness", "raw_jawbone", "raw_neck", "raw_tin_day", "raw_tin_cumber", "raw_tin_max", "raw_movement", "raw_stress", "raw_emotion", "cumberness")
+  x$dist = 0
+  for (colname in attributes) {
+    colname1 <- str_c(colname, ".1") 
+    colname2 <- str_c(colname, ".2") 
+    
+    x <- x %>% mutate(dist = dist + (.data[[colname1]] - .data[[colname2]])^2)
+  }
+  
+  return(x) #euclidian distance ends with calculating the nth root, but as I just need the order, not the actual values, this constant factor can be ignored
+}
+
+#day similarity using cosine distance
+distance.day_single_manhattan <- function(x1, x2) {
+  x <- manhattan(x1, x2)
+  x <- x %>% filter(!is.na(dist))
+  
+  return(min(x$dist))
+}
+
+#day similarity using cosine distance
+distance.day_single_cosine <- function(x1, x2) {
+  x <- cosine(x1, x2)
+  x <- x %>% filter(!is.na(dist))
+  
+  return(min(x$dist))
+}
+
+#day similarity using cosine distance
+distance.day_single_euclidian <- function(x1, x2) {
+  x <- euclidian(x1, x2)
+  x <- x %>% filter(!is.na(dist))
+  
+  return(min(x$dist))
+}
+
+#day similarity using cosine distance
+distance.day_complete_cosine <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  x <- cosine(x1, x2)
+  
+  return(max(x$dist) + very_small_number)
+}
+
+#day similarity using cosine distance
+distance.day_complete_euclidian <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  x <- euclidian(x1, x2)
+  
+  return(max(x$dist) + very_small_number)
+}
+
+#day similarity using cosine distance
+distance.day_complete_manhattan <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  x <- manhattan(x1, x2)
+  
+  return(max(x$dist) + very_small_number)
+}
+
+#day similarity using cosine distance
+distance.day_avg_cosine <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  x <- cosine(x1, x2)
+  
+  return(mean(x$dist) + very_small_number)
+}
+
+#day similarity using cosine distance
+distance.day_avg_manhattan <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  x <- manhattan(x1, x2)
+  
+  return(mean(x$dist) + very_small_number)
+}
+
+#day similarity using cosine distance
+distance.day_avg_euclidian <- function(x1, x2) {
+  if (same_user(x1,x2)) return(0)
+  x <- euclidian(x1, x2)
+  
+  return(mean(x$dist) + very_small_number)
+}
+
+#day similarity
+distance.centroid_cosine <- function(x1, x2) {
+  attributes <- c("raw_loudness", "raw_jawbone", "raw_neck", "raw_tin_day", "raw_tin_cumber", "raw_tin_max", "raw_movement", "raw_stress", "raw_emotion", "cumberness")
+  means1 = c()
+  means2 = c()
+  for (colname in attributes) {
+    means1 <- c(means1, x1 %>% summarize(m = mean(.data[[colname]])) %>% pull(m))
+    means2 <- c(means2, x2 %>% summarize(m = mean(.data[[colname]])) %>% pull(m))
+  }
+
+  cosine_distance = 1 - ((means1*means2) / (sqrt(sum(means1^2)) * sqrt(sum(means2^2)))  )
+  
+  return(cosine_distance)
+}
+
+#day similarity
+distance.centroid_manhattan <- function(x1, x2) {
+  attributes <- c("raw_loudness", "raw_jawbone", "raw_neck", "raw_tin_day", "raw_tin_cumber", "raw_tin_max", "raw_movement", "raw_stress", "raw_emotion", "cumberness")
+  dist <- 0
+  for (colname in attributes) {
+    means1 <- x1 %>% summarize(m = mean(.data[[colname]])) %>% pull(m)
+    means2 <- x2 %>% summarize(m = mean(.data[[colname]])) %>% pull(m)
+    dist = dist + abs(means1 - means2)
+  }
+  
+  return(dist)
+}
+
+#day similarity
+distance.centroid_euclidian <- function(x1, x2) {
+  attributes <- c("raw_loudness", "raw_jawbone", "raw_neck", "raw_tin_day", "raw_tin_cumber", "raw_tin_max", "raw_movement", "raw_stress", "raw_emotion", "cumberness")
+  dist <- 0
+  for (colname in attributes) {
+    means1 <- x1 %>% summarize(m = mean(.data[[colname]])) %>% pull(m)
+    means2 <- x2 %>% summarize(m = mean(.data[[colname]])) %>% pull(m)
+    dist = dist + (means1 - means2)^2
+  }
+  
+  return(dist)
+}
+```
+
+#prediction template to adapt to current model
+```{r fig.height=5, fig.width=20}
+distance.current <- distance.day_single_manhattan
+first <- 5
+first_t <- NULL
+second <- 1
+
+local_data <- data %>% 
+  group_by(user_id) %>%  filter(n() >= 5) %>% ungroup()
+
+#add local date
+minTimes <- local_data %>% group_by(user_id) %>% summarize("min" = min(ts))
+local_data <- local_data %>% left_join(minTimes, by=c("user_id")) %>% mutate(local_date = ts-min) %>% ungroup() 
+
+tmp <- split_intra_patient(local_data, 0.2)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+tmp <- standardize_cumberness(train_data, test_data)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+tmp <- standardize_attributes(train_data, test_data)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]]
+
+attributes <- c("loudness", "jawbone", "neck", "tin_day", "tin_cumber", "tin_max", "movement", "stress", "emotion")
+lm_model <- linear_reg() %>% set_engine('lm') %>% set_mode('regression')
+
+#----------------------first regression------------------------------
+tmp <- regression(train_data, test_data, attributes, lm_model, "std_cumberness", "select", distance.current, amount = first, threshold=first_t)
+train_data <- tmp[[1]]
+test_data <- tmp[[2]] 
+train_data <- train_data %>% rename(predictionGroup = prediction) 
+test_data <- test_data %>% rename(predictionGroup = prediction)
+local_data <- train_data %>% add_row(test_data)
+
+results <- local_data %>% group_by(user_id, split) %>% summarize(MSE = sum(residuals^2)/n())
+
+results %>% ungroup() %>% filter(split=="test") %>% summarize(mean_MSE = mean(MSE), median_MSE = median(MSE))
+```
+
+```{r}
+name <- "day_single_manhattan"
+write_csv(local_data, str_c("model/", name, ".csv"))
+write_csv(results, str_c("results/", name, ".csv"))
+results_single_manhattan <- results
+```
+
+# adapt models to a value range of 0-100
+```{r}
+name <- "day_centroid_cosine"
+model <- read.csv(str_c("model/",name, ".csv"))
+model <- model %>% mutate(pMax = (100-cumberness_mean)/cumberness_stddev)
+model <- model %>% mutate(pMin = (0-cumberness_mean)/cumberness_stddev)
+model <- model %>% 
+  mutate(predictionGroup_constrained = if_else(predictionGroup > pMax, pMax, predictionGroup)) %>%
+  mutate(predictionGroup_constrained = if_else(predictionGroup_constrained < pMin, pMin, predictionGroup_constrained)) %>%
+    mutate(std_residuals_constrained=std_cumberness-predictionGroup_constrained) %>%
+    mutate(residuals_constrained=std_residuals_constrained*cumberness_stddev)
+  
+results <- model %>% group_by(user_id, split) %>% summarize(MSE = sum(residuals_constrained^2)/n())
+
+write_csv(model, str_c("modelConstrained/", name, ".csv"))
+write_csv(results, str_c("resultsConstrained/", name, ".csv"))
+results_centroid_cosine_c <- results
+```
+
+
+##patient based comparison - all
+t-test: a p-value > 0.05 is not significant
+```{r}
+results_local <- results_all_c %>% inner_join(results_single_euclidian_c, by=c("user_id", "split"), suffix=c("_all", "_neighborhood")) %>% filter(split=="test")
+results_local <- results_local %>% mutate(neighborhood_better = (MSE_all > MSE_neighborhood ))
+results_local <- results_local %>% mutate(difference = MSE_all - MSE_neighborhood) %>% ungroup() %>% filter( abs(difference) < Inf & !is.na(difference))
+(results_local %>% filter(neighborhood_better) %>% ungroup() %>% count()) / (results_local %>% ungroup() %>% count())
+ggplot(results_local, aes(y=neighborhood_better)) + geom_boxplot(aes(x=abs(difference), color=neighborhood_better)) 
+ggplot(results_local) + geom_boxplot(aes(x=difference)) 
+difference_summary <- results_local %>% summarize(mean(difference), median(difference), q_high = quantile(difference, 0.95), q_low = quantile(difference, 0.05))
+difference_summary
+
+local_data <- data
+local_data <- local_data %>% inner_join(results_local, by=c("user_id"))
+ggplot(local_data %>% group_by(user_id, difference) %>% summarize(count=n()), aes(x=count, y=difference)) + 
+  stat_summary(fun="median", geom="line")+
+  scale_x_binned(n.breaks=c(10)) +
+  geom_hline(yintercept=0, color="blue", linetype="dashed") +
+  labs(title="Does the length of the patient data play a role?")
+
+correlate(local_data %>% group_by(user_id, difference) %>% summarize(count=n()) %>% ungroup() %>% select(difference, count))
+
+t.test(results_local$MSE_all, results_local$MSE_neighborhood)
+
+#patSize <- local_data %>% group_by(user_id, difference) %>% summarize(count=n()) %>% mutate(model="global")
+```
+
+##patient based comparison - random
+t-test: a p-value > 0.05 is not significant
+```{r}
+results_local <- results_random_c %>% inner_join(results_single_euclidian_c, by=c("user_id", "split"), suffix=c("_random", "_nonrandom")) %>% filter(split=="test")
+results_local <- results_local %>% mutate(nonrandom_better = (MSE_random > MSE_nonrandom))
+results_local <- results_local %>% mutate(difference = MSE_random - MSE_nonrandom) %>% ungroup() %>% filter( abs(difference) < Inf & !is.na(difference))
+(results_local %>% filter(nonrandom_better) %>% count()) / (results_local %>% count())
+ggplot(results_local, aes(y=nonrandom_better)) + geom_boxplot(aes(x=abs(difference), color=nonrandom_better)) 
+ggplot(results_local) + geom_boxplot(aes(x=difference)) 
+difference_summary <- results_local %>% summarize(mean(difference), median(difference), q_high = quantile(difference, 0.95), q_low = quantile(difference, 0.05))
+difference_summary
+
+local_data <- data
+local_data <- local_data %>% inner_join(results_local, by=c("user_id"))
+ggplot(local_data %>% group_by(user_id, difference) %>% summarize(count=n()), aes(x=count, y=difference)) + 
+  geom_smooth()+
+  geom_hline(yintercept=0, color="blue", linetype="dashed") +
+  labs(title="Does the length of the patient data play a role?")
+
+correlate(local_data %>% group_by(user_id, difference) %>% summarize(count=n()) %>% ungroup() %>% select(difference, count))
+
+t.test(results_local$MSE_random, results_local$MSE_nonrandom)
+
+#patSize <- patSize %>% bind_rows(local_data %>% group_by(user_id, difference) %>% summarize(count=n()) %>% mutate(model="random"))
+```
+
+##patient based comparison - no_neighbors
+t-test: a p-value > 0.05 is not significant
+```{r}
+results_local <- results_NoNeighbors_c %>% inner_join(results_single_euclidian_c, by=c("user_id", "split"), suffix=c("_no_neighbors", "_with_neighbors")) %>% filter(split=="test")
+results_local <- results_local %>% mutate(neighbors_better = (MSE_no_neighbors > MSE_with_neighbors))
+results_local <- results_local %>% mutate(difference = MSE_no_neighbors - MSE_with_neighbors) %>% ungroup() %>% filter( abs(difference) < Inf & !is.na(difference))
+(results_local %>% filter(neighbors_better) %>% ungroup() %>% count()) / (results_local %>% ungroup() %>% count())
+ggplot(results_local) + geom_boxplot(aes(x=difference)) 
+difference_summary <- results_local %>% summarize(mean(difference), median(difference), q_high = quantile(difference, 0.95), q_low = quantile(difference, 0.05))
+difference_summary
+
+local_data <- data
+local_data <- local_data %>% inner_join(results_local, by=c("user_id"))
+ggplot(local_data %>% group_by(user_id, difference) %>% summarize(count=n()), aes(x=count, y=difference)) + 
+  geom_smooth()+
+  geom_hline(yintercept=0, color="blue", linetype="dashed") +
+  labs(title="Does the length of the patient data play a role?") 
+
+correlate(local_data %>% group_by(user_id, difference) %>% summarize(count=n()) %>% ungroup() %>% select(difference, count))
+
+t.test(results_local$MSE_no_neighbors, results_local$MSE_with_neighbors)
+
+#patSize <- patSize %>% bind_rows(local_data %>% group_by(user_id, difference) %>% summarize(count=n()) %>% mutate(model="personalized"))
+```
+```{r fig.height=3, fig.width=18}
+names <- c("global", "random", "personalized")
+medians <- c(1.067197, 0.3589134, 3.10394)
+correlations <- c(-0.0476226, -0.05544439, -0.1887575)
+count_better <- c(0.5462185, 0.5336134,	0.6302521)
+differences <- data.frame(names, medians, correlations, count_better) # collection of medians of all the analysis above (manually)
+ggplot(differences, aes(y=names, x=medians)) + geom_col(fill="slategrey") +
+  scale_x_continuous(name="median MSE difference", limits=c(0,4)) +
+  scale_y_discrete(name="") +
+  theme_bw() + theme(text=element_text(size=30)) +
+  geom_text(aes(label=round(medians,1)), nudge_x=0.15, size=10, color="darkslategrey")
+ggsave("images/MSE_difference_constrained.jpg", height=3, width=15)
+
+ggplot(differences, aes(y=names, x=correlations)) + geom_col(fill="slategrey") +
+  scale_x_continuous(name="correlation of MSE difference with data length", limits=c(-1,1)) +
+  scale_y_discrete(name="") +
+  theme_bw() + theme(text=element_text(size=30)) + 
+  geom_vline(xintercept=0, color="blue", linetype="dashed" , linewidth=2) +
+  geom_text(aes(label=round(correlations,1), x = correlations), size=10, nudge_x=-0.08, color="darkslategrey")
+ggsave("images/length_correlations_constrained.jpg", height=3, width=15)
+
+ggplot(differences, aes(y=names, x=count_better)) + geom_col(fill="slategrey") +
+  scale_x_continuous(name="percentage of patients better predicted by euclidean single n.", limits=c(0,1), 
+                     breaks=seq(0,1,0.25),labels=c("0%", "25%", "50%", "75%", "100%")) +
+  scale_y_discrete(name="") +
+  theme_bw() + theme(text=element_text(size=30)) +
+  geom_vline(xintercept=0.5, color="blue", linetype="dashed", linewidth=2) +
+  geom_text(aes(label=str_c(round(count_better,2)*100,"%")), nudge_x=0.05, size=10, color="darkslategrey")
+ggsave("images/count_better_constrained.jpg", height=3, width=15)
+```
+```{r fig.height=3, fig.width=18}
+ggplot(patSize, aes(x=count, y=difference, group=model, color=model)) + 
+  #geom_smooth()+
+   stat_summary(fun.y="median", geom="line", size=1)+
+  scale_x_binned(n.breaks=20, limits=c(0,200))+
+  geom_hline(yintercept=0, color="black", linetype="dashed") +
+  theme_bw()
+
+getBin <- function(count) {
+  if (count <= 10) return("0-10")
+  if (count <= 20) return("11-20")
+  if (count <= 50) return("21-50")
+  return("51-500")
+}
+
+medianPatSize <- patSize %>% rowwise %>% mutate(countBin = getBin(count))
+medianPatSize <- medianPatSize %>% group_by(model, countBin) %>% summarize(median_difference = median(difference))
+medianPatSize$countBin <- factor(medianPatSize$countBin, levels=c("0-10", "11-20", "21-50", "51-500"))
+ggplot(medianPatSize, aes(x=countBin, y=median_difference, group=model, fill=model)) + 
+  geom_col(position="dodge") +
+  geom_hline(yintercept=0) +
+  coord_flip() +
+  theme_bw() + theme(text=element_text(size=30)) +
+  scale_x_discrete(name="data entries") +
+  scale_y_continuous(name="median MSE difference") +
+  scale_fill_brewer(palette="Set1")
+ggsave("images/entry_size_MSE_constrained.jpg", height=3, width=15)
+
+medianPatSize <- patSize %>% group_by(model) %>% summarize(median_difference = median(difference))
+ggplot(medianPatSize, aes(x=1, y=median_difference, group=model, fill=model)) + 
+  geom_col(position="dodge") +
+  geom_hline(yintercept=0) +
+  coord_flip() +
+  theme_bw() + theme(text=element_text(size=30)) +
+  scale_x_discrete(name="data entries") +
+  scale_y_continuous(name="median MSE difference") +
+  scale_fill_brewer(palette="Set1")
+#patSize %>% ungroup() %>% filter(count <= 10) %>% filter(model=="personalized") %>% summarize(median(difference))
+```
+
+# sample
+```{r}
+#sample
+sample <- local_data %>% sample_data(1)
+ggplot(sample, aes(x=loudness)) + geom_point(aes(y=std_cumberness, color=split), alpha=0.8) +geom_line(aes(y=prediction),alpha=0.3)
+ggplot(sample, aes(x=ts)) + geom_point(aes(y=std_cumberness, color=split), alpha=0.8) +geom_line(aes(y=prediction),alpha=0.3)
+ggplot(sample, aes(x=ts)) + geom_point(aes(y=residuals, color=split), alpha=0.8) + geom_hline(yintercept=0)
+```
+
+
+## iterate different neighborhood sizes for one distance function
+```{r fig.height=5, fig.width=20}
+distance.current <- distance.day_single
+first_t <- NULL
+second <- 1
+
+summary <- data.frame()
+#for (first_t in seq(50, 150, by = 5)) {
+for(first in c(1,3,5,10,15, 20)) {
+ 
+  local_data <- data %>% 
+    standardize_cumberness() %>% #standardizes cumberness as std_cumberness
+    standardize_attributes() %>% #standardizes other attributes under their original names!
+    group_by(user_id) %>%  filter(n() >= 5) %>% ungroup()
+  
+  #subset for faster calculations
+  sample_id <- local_data %>% select(user_id) %>% distinct() %>% slice_sample(n=200)
+  local_data <- local_data %>% filter (user_id %in% sample_id$user_id)
+  
+  #add local date
+  minTimes <- local_data %>% group_by(user_id) %>% summarize("min" = min(ts))
+  local_data <- local_data %>% left_join(minTimes, by=c("user_id")) %>% mutate(local_date = ts-min) %>% ungroup() 
+  
+  tmp <- split_intra_patient(local_data, 0.2)
+  train_data <- tmp[[1]]
+  test_data <- tmp[[2]] 
+  
+  attributes <- c("loudness", "jawbone", "neck", "tin_day", "tin_cumber", "tin_max", "movement", "stress", "emotion")
+  lm_model <- linear_reg() %>% set_engine('lm') %>% set_mode('regression')
+  
+  #----------------------first regression------------------------------
+  tmp <- regression(train_data, test_data, attributes, lm_model, "std_cumberness", "select", amount = first, threshold=first_t)
+  train_data <- tmp[[1]]
+  test_data <- tmp[[2]] 
+
+  local_data <- train_data %>% add_row(test_data) #join train, test
+  local_data <- local_data %>%
+    mutate(std_residuals=std_cumberness-prediction) %>%
+    mutate(residuals=std_residuals*cumberness_stddev)
+  
+  results <- local_data %>% group_by(user_id, split) %>% summarize(MSE = sum(residuals^2)/n())
+  
+  
+  summary <- summary %>% bind_rows(results %>% group_by(split) %>%
+                                     summarize(avg=mean(MSE), median=median(MSE)) %>% mutate(Nfirst=first, Nsecond=second))
+  #    summarize(avg=mean(MSE), median=median(MSE)) %>% mutate(first_t=first_t))
+}
+
+summary
+
+```
+
+# Plot nr neighborhood dependencies
+```{r fig.height=6, fig.width=7}
+ggplot(summary %>% filter(split == "test"), aes(x=Nfirst, y=avg)) + geom_col() +  
+  labs(title="average") + scale_fill_gradient(high="whiteSmoke", low="black") + theme_bw() + scale_y_continuous(limits=c(0,100))
+  
+ggplot(summary %>% filter(split == "test"), aes(x=Nfirst, y=median)) + geom_col() + 
+  labs(title="median") + scale_fill_gradient(high="whiteSmoke", low="black") + theme_bw()
+```
+
+# Final Model visualization
+```{r fig.height=10, fig.width=20}
+allModels <- results_noNeighbors %>% mutate(model="Baseline personalized") %>% mutate(color="A", linkage="")
+allModels <- allModels %>% bind_rows(results_random %>% mutate(model="Baseline random") %>% mutate(color="A", linkage=""))
+allModels <- allModels %>% bind_rows(results_all %>% mutate(model="Baseline global") %>% mutate(color="A", linkage=""))
+
+allModels <- allModels %>% bind_rows(results_corr_euclidian %>% mutate(model="correlation euclidian") %>% mutate(color="F", linkage=""))
+allModels <- allModels %>% bind_rows(results_corr_cosine %>% mutate(model="correlation cosine") %>% mutate(color="F", linkage=""))
+
+allModels <- allModels %>% bind_rows(results_single_cosine %>% mutate(model="cosine single") %>% mutate(color="D", linkage="single"))
+allModels <- allModels %>% bind_rows(results_complete_cosine %>% mutate(model="cosine complete") %>% mutate(color="D", linkage="complete"))
+allModels <- allModels %>% bind_rows(results_centroid_cosine %>% mutate(model="cosine centroid") %>% mutate(color="D", linkage="centroid"))
+allModels <- allModels %>% bind_rows(results_avg_cosine %>% mutate(model="cosine average") %>% mutate(color="D", linkage="average"))
+
+allModels <- allModels %>% bind_rows(results_single_euclidian %>% mutate(model="euclidean single") %>% mutate(color="E", linkage="single"))
+allModels <- allModels %>% bind_rows(results_complete_euclidian %>% mutate(model="euclidean complete") %>% mutate(color="E", linkage="complete"))
+allModels <- allModels %>% bind_rows(results_avg_euclidian %>% mutate(model="euclidean average") %>% mutate(color="E", linkage="average"))
+allModels <- allModels %>% bind_rows(results_centroid_euclidian %>% mutate(model="euclidean centroid") %>% mutate(color="E", linkage="centroid"))
+
+allModels_test <- allModels %>% 
+  filter(split == "test")
+
+summary <- allModels_test %>% group_by(model, color) %>% summarize(mean_MSE = mean(MSE), median_MSE = median(MSE))
+
+ggplot(summary, aes(x=model, y=median_MSE, fill=color)) + geom_col() + theme_bw()  + 
+  theme(legend.position="None", text=element_text(size=40), panel.grid.minor.y = element_blank(), panel.grid.major.y = element_blank()) +
+  coord_flip() +
+  scale_y_continuous(breaks=seq(0,100,5)) +
+  geom_text(aes(label=round(median_MSE,1)), nudge_y=2.5, size=10, color="darkslategrey") +
+  scale_fill_brewer(palette="Set2")
+ggsave("images/allModels.jpg", width=20, height=10)
+```
+
+# Final model visualization - constrained
+```{r fig.height=10, fig.width=20}
+allModels <- results_NoNeighbors_c %>% mutate(model="Baseline personalized") %>% mutate(color="A", linkage="")
+allModels <- allModels %>% bind_rows(results_random_c %>% mutate(model="Baseline random") %>% mutate(color="A", linkage=""))
+allModels <- allModels %>% bind_rows(results_all_c %>% mutate(model="Baseline global") %>% mutate(color="A", linkage=""))
+
+allModels <- allModels %>% bind_rows(results_corr_euclidian_c %>% mutate(model="correlation euclidian") %>% mutate(color="F", linkage=""))
+allModels <- allModels %>% bind_rows(results_corr_cosine_c %>% mutate(model="correlation cosine") %>% mutate(color="F", linkage=""))
+
+allModels <- allModels %>% bind_rows(results_single_cosine_c %>% mutate(model="cosine single") %>% mutate(color="D", linkage="single"))
+allModels <- allModels %>% bind_rows(results_complete_cosine_c %>% mutate(model="cosine complete") %>% mutate(color="D", linkage="complete"))
+allModels <- allModels %>% bind_rows(results_centroid_cosine_c %>% mutate(model="cosine centroid") %>% mutate(color="D", linkage="centroid"))
+allModels <- allModels %>% bind_rows(results_avg_cosine_c %>% mutate(model="cosine average") %>% mutate(color="D", linkage="average"))
+
+allModels <- allModels %>% bind_rows(results_single_euclidian_c %>% mutate(model="euclidean single") %>% mutate(color="E", linkage="single"))
+allModels <- allModels %>% bind_rows(results_complete_euclidian_c %>% mutate(model="euclidean complete") %>% mutate(color="E", linkage="complete"))
+allModels <- allModels %>% bind_rows(results_avg_euclidian_c %>% mutate(model="euclidean average") %>% mutate(color="E", linkage="average"))
+allModels <- allModels %>% bind_rows(results_centroid_euclidian_c %>% mutate(model="euclidean centroid") %>% mutate(color="E", linkage="centroid"))
+
+allModels_test <- allModels %>% 
+  filter(split == "test") #%>%
+
+summary <- allModels_test %>% group_by(model, color) %>% summarize(mean_MSE = mean(MSE), median_MSE = median(MSE))
+
+ggplot(summary, aes(x=model, y=median_MSE, fill=color)) + geom_col() + theme_bw()  + 
+  theme(legend.position="None", text=element_text(size=40), panel.grid.minor.y = element_blank(), panel.grid.major.y = element_blank()) +
+  coord_flip() +
+  scale_y_continuous(breaks=seq(0,100,5)) +
+  geom_text(aes(label=round(median_MSE,1)), nudge_y=2.5, size=10, color="darkslategrey") +
+  scale_fill_brewer(palette="Set2")
+ggsave("images/allModels_constrained.jpg", width=20, height=10)
+```

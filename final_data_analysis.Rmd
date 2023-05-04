@@ -1,0 +1,93 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup}
+source('functions.R')
+
+data <- setup_diary()
+```
+
+# ACF all patients
+```{r fig.height=3, fig.width=10}
+local_data <- data %>% group_by(user_id) %>%  filter(n() >= 5) %>% ungroup() 
+
+#time data
+local_data <- as_tsibble(local_data, index = ts, key=user_id) %>% mutate(cumberness_diff = difference(x=cumberness))
+
+#acf
+acf_data <- ACF(local_data %>% fill_gaps() %>% group_by(user_id), y=cumberness, lag_max=50) 
+ggplot(acf_data, aes(x=lag, y=acf)) + geom_boxplot(aes(group=lag), fill="lightgray") + geom_hline(yintercept=0.2, color="blue", linetype="dashed") +  
+  geom_hline(yintercept=-0.2, color="blue", linetype="dashed") + 
+  scale_x_continuous(breaks=seq(0,50,10))+ scale_y_continuous(limits=c(-1,1)) +
+  theme_bw()  + theme(text=element_text(size=20))
+
+#acf difference
+acf_diff_data <- ACF(local_data %>% fill_gaps() %>% group_by(user_id), y=cumberness_diff, lag_max=50) 
+ggplot(acf_diff_data, aes(x=lag, y=acf)) + geom_boxplot(aes(group=lag), fill="lightgray") + geom_hline(yintercept=0.2, color="blue", linetype="dashed") + geom_hline(yintercept=-0.2, color="blue", linetype="dashed") + theme_bw() + scale_y_continuous(limits=c(-1,1))
+```
+
+# global time correlations?
+```{r fig.height=4, fig.width=15}
+#normalize data
+local_data <- data %>% group_by(user_id) %>%  filter(n() >= 5) %>% ungroup() 
+
+#time data
+local_data <- as_tsibble(local_data, index = ts, key=user_id)
+local_data <- local_data %>% mutate(cumberness_diff = difference(x=cumberness))
+
+ggplot(local_data, aes(x=ts, y=cumberness_diff))+ geom_point(alpha=0.3)
+ggplot(local_data %>% filter_index("2021-07-01" ~ "2021-07-20"), aes(x=ts, y=cumberness_diff))+ geom_point(alpha=0.3)
+ggplot(local_data %>% filter_index("2021-07-01" ~ "2021-07-20"), aes(x=ts, y=cumberness_diff))+ geom_boxplot(aes(group=ts))
+```
+# global time correlations with standardized data?
+```{r fig.height=4, fig.width=15}
+#normalize data
+local_data <- data %>% group_by(user_id) %>%  filter(n() >= 5) %>% ungroup() 
+
+#standardize
+data_summary <- local_data %>% group_by(name) %>% summarize("cumberness_mean"=mean(cumberness), "cumberness_stddev"=sd(cumberness))
+local_data <- local_data %>% left_join(data_summary, by="name") %>% mutate(cumberness_std = (cumberness-cumberness_mean)/cumberness_stddev)
+
+#time data
+local_data <- as_tsibble(local_data, index = ts, key=user_id)
+
+#visualize
+ggplot(local_data, aes(x=ts, y=cumberness_std))+ geom_point(alpha=0.3)
+ggplot(local_data %>% filter_index("2021-07-01" ~ "2021-07-20"), aes(x=ts, y=cumberness_std))+ geom_point(alpha=0.3)
+ggplot(local_data %>% filter_index("2021-07-01" ~ "2021-07-20"), aes(x=ts, y=cumberness_std))+ geom_boxplot(aes(group=ts))
+```
+# correlations
+```{r fig.height=5, fig.width=15}
+attributes <- c("loudness", "cumberness", "jawbone", "neck", "tin_day", "tin_cumber", "tin_max", "movement", "stress", "emotion")
+local_data <- data %>% group_by(user_id) %>%  filter(n() >= 5)
+
+cormatrix <- local_data %>% ungroup() %>% select(all_of(attributes)) %>% correlate(diagonal=1, quiet=TRUE) %>% pivot_longer(cols=all_of(attributes), names_to="term2", values_to="correlation")
+ggplot(cormatrix, aes(x=term, y=term2, z=correlation)) + geom_tile(aes(fill=correlation)) + scale_fill_gradient2(limits=c(-1,1), low="green", high="blue", mid="white")
+
+
+# what is the strongest correlation per user?
+correlations <- local_data %>% select(all_of(attributes)) %>% 
+  summarize(correlate(x=cur_data(), diagonal=1, quiet=TRUE) %>% filter(term=="cumberness")) %>% #pearson correlation! assumes linear relationship like regression
+  select(!c("term"))
+cor_vis_data <- correlations %>% pivot_longer(cols=all_of(attributes), names_to="term", values_to="correlation")
+cor_vis_data <- cor_vis_data %>% mutate(term = ifelse(term == "cumberness", "distress", term))
+ggplot(cor_vis_data, aes(x=term, y=correlation, group=user_id)) + 
+  geom_hline(yintercept=0, color="blue", linetype="dashed") +
+  geom_line(alpha=0.25) + 
+  theme_bw() + theme(legend.position="None", text=element_text(size=20))  + 
+  scale_y_continuous(limits=c(-1,1), name="correlation with distress") +
+  scale_x_discrete(name="predictor variable")
+ggsave("images/correlations.jpg", height=3, width=15)
+
+#only show users who's strongest correlation is not distress
+highest_corr <- cor_vis_data %>% filter(term != "distress") %>% group_by(user_id) %>% slice_max(correlation) %>% rename(max_term=term, max_correlation=correlation)
+ggplot(highest_corr, aes(x=max_term)) + geom_bar()
+ggplot(highest_corr, aes(x=max_term, y=max_correlation)) + geom_point(aes(alpha=0.3))
+ggplot(cor_vis_data %>% left_join(highest_corr), aes(x=term, y=correlation, color=max_term, group=user_id)) + geom_line() + theme_bw()
+ggplot(cor_vis_data %>% left_join(highest_corr) %>% filter(max_term!="loudness"), aes(x=term, y=correlation, color=max_term, group=user_id)) + geom_line() + theme_bw()
+```
